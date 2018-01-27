@@ -10,6 +10,9 @@
 """
 
 import time
+import mysql.connector
+import MySQLdb as mdb
+import sys
 from sqlite3 import dbapi2 as sqlite3
 from hashlib import md5
 from datetime import datetime
@@ -19,10 +22,10 @@ from werkzeug import check_password_hash, generate_password_hash
 
 
 # configuration
-DATABASE = '/tmp/minitwit.db'
+DATABASE = 'minitwit.cluster-czp7u1xduzh8.us-west-2.rds.amazonaws.com'
 PER_PAGE = 30
 DEBUG = True
-SECRET_KEY = b'_5#y2L"F4Q8z\n\xec]/'
+SECRET_KEY = b'minitwit'
 
 # create our little application :)
 app = Flask('minitwit')
@@ -33,12 +36,20 @@ app.config.from_envvar('MINITWIT_SETTINGS', silent=True)
 def get_db():
     """Opens a new database connection if there is none yet for the
     current application context.
-    """
+
     top = _app_ctx_stack.top
     if not hasattr(top, 'sqlite_db'):
         top.sqlite_db = sqlite3.connect(app.config['DATABASE'])
         top.sqlite_db.row_factory = sqlite3.Row
     return top.sqlite_db
+"""
+ # sqlite_db is the connection to the db
+    top = _app_ctx_stack.top
+    if not hasattr(top, 'sqlite_db'):
+        top.sqlite_db = mdb.connect(user="minitwit", passwd='minitwit',host="minitwit.cluster-czp7u1xduzh8.us-west-2.rds.amazonaws.com",db="minitwit_db",port=3306)
+    return top.sqlite_db
+       
+        
 
 
 @app.teardown_appcontext
@@ -66,15 +77,18 @@ def initdb_command():
 
 def query_db(query, args=(), one=False):
     """Queries the database and returns a list of dictionaries."""
-    cur = get_db().execute(query, args)
-    rv = cur.fetchall()
-    return (rv[0] if rv else None) if one else rv
 
+    cur = get_db().cursor(mdb.cursors.DictCursor)
+
+    cur.execute(query)
+    
+    rv = cur.fetchall()
+    
+    return (rv.fetch_row()[0] if rv else None)if one else rv
 
 def get_user_id(username):
     """Convenience method to look up the id for a username."""
-    rv = query_db('select user_id from user where username = ?',
-                  [username], one=True)
+    rv = query_db("select user_id from user where username = '%s'" % username)
     return rv[0] if rv else None
 
 
@@ -93,8 +107,8 @@ def gravatar_url(email, size=80):
 def before_request():
     g.user = None
     if 'user_id' in session:
-        g.user = query_db('select * from user where user_id = ?',
-                          [session['user_id']], one=True)
+        g.user = query_db('select * from user where user_id = %s'%
+                          session['user_id'])
 
 
 @app.route('/')
@@ -108,11 +122,11 @@ def timeline():
     return render_template('timeline.html', messages=query_db('''
         select message.*, user.* from message, user
         where message.author_id = user.user_id and (
-            user.user_id = ? or
+            user.user_id = %s or
             user.user_id in (select whom_id from follower
-                                    where who_id = ?))
-        order by message.pub_date desc limit ?''',
-        [session['user_id'], session['user_id'], PER_PAGE]))
+                                    where who_id = %s))
+        order by message.pub_date desc limit %s'''%
+        (session['user_id'], session['user_id'], PER_PAGE)))
 
 
 @app.route('/public')
@@ -120,29 +134,27 @@ def public_timeline():
     """Displays the latest messages of all users."""
     return render_template('timeline.html', messages=query_db('''
         select message.*, user.* from message, user
-        where message.author_id = user.user_id
-        order by message.pub_date desc limit ?''', [PER_PAGE]))
+        where message.author_id = user.user_id'''))
 
 
 @app.route('/<username>')
 def user_timeline(username):
     """Display's a users tweets."""
-    profile_user = query_db('select * from user where username = ?',
-                            [username], one=True)
+    profile_user = query_db("select * from user where username = '%s'" % username)
     if profile_user is None:
         abort(404)
     followed = False
     if g.user:
         followed = query_db('''select 1 from follower where
-            follower.who_id = ? and follower.whom_id = ?''',
-            [session['user_id'], profile_user['user_id']],
-            one=True) is not None
+            follower.who_id = %s and follower.whom_id = %s''',
+            (session['user_id'], profile_user['user_id'])) is not None
     return render_template('timeline.html', messages=query_db('''
             select message.*, user.* from message, user where
-            user.user_id = message.author_id and user.user_id = ?
-            order by message.pub_date desc limit ?''',
-            [profile_user['user_id'], PER_PAGE]), followed=followed,
+            user.user_id = message.author_id and user.user_id = %s
+            order by message.pub_date desc limit %s''' %
+            ([profile_user['user_id'], PER_PAGE])), followed=followed,
             profile_user=profile_user)
+
 
 
 @app.route('/<username>/follow')
@@ -154,8 +166,9 @@ def follow_user(username):
     if whom_id is None:
         abort(404)
     db = get_db()
-    db.execute('insert into follower (who_id, whom_id) values (?, ?)',
-              [session['user_id'], whom_id])
+
+    db.cursor().execute("insert into follower (who_id, whom_id) values (%s, %s)" %
+              (session['user_id'], whom_id))
     db.commit()
     flash('You are now following "%s"' % username)
     return redirect(url_for('user_timeline', username=username))
@@ -170,8 +183,8 @@ def unfollow_user(username):
     if whom_id is None:
         abort(404)
     db = get_db()
-    db.execute('delete from follower where who_id=? and whom_id=?',
-              [session['user_id'], whom_id])
+    db.cursor().execute("delete from follower where who_id=%s and whom_id=%s" %
+              (session['user_id'], whom_id))
     db.commit()
     flash('You are no longer following "%s"' % username)
     return redirect(url_for('user_timeline', username=username))
@@ -184,8 +197,8 @@ def add_message():
         abort(401)
     if request.form['text']:
         db = get_db()
-        db.execute('''insert into message (author_id, text, pub_date)
-          values (?, ?, ?)''', (session['user_id'], request.form['text'],
+        db.cursor().execute('''insert into message (author_id, text, pub_date)
+          values (%s, '%s', '%s')''' % (session['user_id'], request.form['text'],
                                 int(time.time())))
         db.commit()
         flash('Your message was recorded')
@@ -200,15 +213,17 @@ def login():
     error = None
     if request.method == 'POST':
         user = query_db('''select * from user where
-            username = ?''', [request.form['username']], one=True)
+            username = '%s' ''' % request.form['username'])
+        print user
+        print user[0]['username']
         if user is None:
             error = 'Invalid username'
-        elif not check_password_hash(user['pw_hash'],
+        elif not check_password_hash(user[0]['pw_hash'],
                                      request.form['password']):
             error = 'Invalid password'
         else:
             flash('You were logged in')
-            session['user_id'] = user['user_id']
+            session['user_id'] = user[0]['user_id']
             return redirect(url_for('timeline'))
     return render_template('login.html', error=error)
 
@@ -233,10 +248,12 @@ def register():
             error = 'The username is already taken'
         else:
             db = get_db()
-            db.execute('''insert into user (
-              username, email, pw_hash) values (?, ?, ?)''',
-              [request.form['username'], request.form['email'],
-               generate_password_hash(request.form['password'])])
+            print "username %s" % request.form['username']
+            print "password %s" % request.form['password']
+            db.cursor().execute('''insert into user (
+              username, email, pw_hash) values ('%s', '%s', '%s')''' %
+              (request.form['username'], request.form['email'],
+               generate_password_hash(request.form['password'])))
             db.commit()
             flash('You were successfully registered and can login now')
             return redirect(url_for('login'))
